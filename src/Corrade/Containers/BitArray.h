@@ -87,6 +87,12 @@ the @ref Array class:
     Useful when you'll be overwriting the contents anyway. Equivalent to
     @cpp new char[(size + 7)/8] @ce.
 
+Arrays of at most @ref Implementation::SmallMaxBits "184 bits" (88 on 32-bit)
+are stored in-place inside the instance instead of being heap-allocated.
+@ref data() then points into the instance and is invalidated on move.
+@ref release() copies the bits into a @cpp new[] @ce allocation so the
+caller can still @cpp delete[] @ce it.
+
 @snippet Containers.cpp BitArray-usage-initialization
 
 <b></b>
@@ -101,11 +107,13 @@ the @ref Array class:
 @subsection Containers-BitArray-usage-wrapping Wrapping externally allocated bit arrays
 
 Similarly to @ref Array, by default the class makes all allocations using
-@cpp operator new[] @ce and deallocates using @cpp operator delete[] @ce. It's
-however also possible to wrap an externally allocated array using
+@cpp operator new[] @ce and deallocates using @cpp operator delete[] @ce,
+with the exception of arrays of at most 184 bits (88 on 32-bit), which are
+stored in-place.
+It's however also possible to wrap an externally allocated array using
 @ref BitArray(void*, std::size_t, std::size_t, Deleter) together with
 specifying which function to use for deallocation. In addition to a size in
-bits, there's also an offset argument specifying the starting bit in the fist
+bits, there's also an offset argument specifying the starting bit in the first
 byte, consistently with a @ref BasicBitArrayView "BitArrayView". Often it will
 be @cpp 0 @ce however.
 
@@ -133,8 +141,8 @@ class CORRADE_UTILITY_EXPORT BitArray {
            constructZeroNullPointerAmbiguity() test for more info. FFS, zero as
            null pointer was deprecated in C++11 already, why is this still a
            problem?! */
-        template<class T, typename std::enable_if<std::is_same<std::nullptr_t, T>::value, int>::type = 0> /*implicit*/ BitArray(T) noexcept: _data{}, _sizeOffset{}, _deleter{} {}
-        /*implicit*/ BitArray() noexcept: _data{}, _sizeOffset{}, _deleter{} {}
+        template<class T, typename std::enable_if<std::is_same<std::nullptr_t, T>::value, int>::type = 0> /*implicit*/ BitArray(T) noexcept: large{} {}
+        /*implicit*/ BitArray() noexcept: large{} {}
         #endif
 
         /**
@@ -215,7 +223,8 @@ class CORRADE_UTILITY_EXPORT BitArray {
         /**
          * @brief Destructor
          *
-         * Calls @ref deleter() on the owned @ref data().
+         * Calls @ref deleter() on the owned @ref data(). An in-place array
+         * has nothing to delete.
          */
         ~BitArray();
 
@@ -242,10 +251,11 @@ class CORRADE_UTILITY_EXPORT BitArray {
          * @brief Array data
          *
          * Use @ref offset() to get location of the first bit pointed to by the
-         * array.
+         * array. For an in-place array the returned pointer addresses storage
+         * inside the instance and is invalidated by a move.
          */
-        char* data() { return _data; }
-        const char* data() const { return _data; } /**< @overload */
+        char* data() { if(isSmall()) { return small.data; } return large.data; }
+        const char* data() const { if(isSmall()) { return small.data; } return large.data; } /**< @overload */
 
         /**
          * @brief Array deleter
@@ -254,7 +264,7 @@ class CORRADE_UTILITY_EXPORT BitArray {
          * @cpp operator delete[] @ce.
          * @see @ref BitArray(void*, std::size_t, std::size_t, Deleter)
          */
-        Deleter deleter() const { return _deleter; }
+        Deleter deleter() const { return isSmall() ? nullptr : large.deleter; }
 
         /**
          * @brief Offset in the first byte
@@ -265,21 +275,23 @@ class CORRADE_UTILITY_EXPORT BitArray {
          * constructor.
          * @see @ref size()
          */
-        std::size_t offset() const { return _sizeOffset & 0x07; }
+        std::size_t offset() const { return isSmall() ? 0 : (large.sizeOffset & 0x07); }
 
         /**
          * @brief Size in bits
          *
          * @see @ref isEmpty(), @ref offset()
          */
-        std::size_t size() const { return _sizeOffset >> 3; }
+        std::size_t size() const {
+            return isSmall() ? small.size - SmallSizeMark : large.sizeOffset >> 3;
+        }
 
         /**
          * @brief Whether the array is empty
          *
          * @see @ref size()
          */
-        bool isEmpty() const { return !(_sizeOffset >> 3); }
+        bool isEmpty() const { return size() == 0; }
 
         /**
          * @brief Bit at given position
@@ -433,78 +445,130 @@ class CORRADE_UTILITY_EXPORT BitArray {
          * deleter to be equivalent to a default-constructed instance. Deleting
          * the returned array is user responsibility --- note the array might
          * have a custom @ref deleter() and so @cpp delete[] @ce might not be
-         * always appropriate.
+         * always appropriate. An in-place
+         * array is copied into a @cpp new[] @ce allocation first;
+         * @cpp delete[] @ce is then the right way to free that pointer.
          */
-        /* MinGW complains loudly if the declaration doesn't also have inline */
-        inline char* release();
+        char* release();
 
-    private:
-        char* _data;
-        /* The low 3 bits are bit offset in the _data, the rest is size in
-           bits. On 32bit systems this means the view can only address 512M
-           bits (64 MB of memory). While the offset is used only by the
-           wrapping constructor and thus could theoretically be omitted, it
-           makes the restrictions match BitArrayView. If it wouldn't match,
-           slicing would be impossible for large arrays. */
-        std::size_t _sizeOffset;
-        void(*_deleter)(char*, std::size_t);
+        private:
+            enum: std::size_t {
+                /* 23 bytes on 64-bit, 11 on 32-bit. Same budget as String SSO,
+                   all of it used for bits: 184 / 88. */
+                SmallDataSize = sizeof(std::size_t)*3 - 1,
+                SmallMaxBits = SmallDataSize*8,
+                /* Stored as `size + SmallSizeMark`, so every in-place size has
+                   a bit in SmallSizeMask set. 0x40 alone is not enough: a size
+                   of 64 encodes as 0x80. Large sizeOffset keeps both bits
+                   clear, same reservation as String. */
+                SmallSizeMark = 0x40,
+                SmallSizeMask = 0xc0
+            };
+
+            /* Field order matches String so this size byte and the most
+               significant byte of sizeOffset occupy the same address on both
+               endians. */
+            struct Large {
+                #ifdef CORRADE_TARGET_BIG_ENDIAN
+                std::size_t sizeOffset;
+                char* data;
+                void(*deleter)(char*, std::size_t);
+                #else
+                char* data;
+                void(*deleter)(char*, std::size_t);
+                std::size_t sizeOffset;
+                #endif
+            };
+            struct Small {
+                #ifdef CORRADE_TARGET_BIG_ENDIAN
+                unsigned char size;
+                char data[SmallDataSize];
+                #else
+                char data[SmallDataSize];
+                unsigned char size;
+                #endif
+            };
+            union {
+                Large large{};
+                Small small;
+            };
+
+            static_assert(sizeof(Large) == sizeof(Small),
+                "in-place and heap BitArray representations have to be the same size");
+            static_assert(SmallMaxBits + SmallSizeMark <= 255,
+                "in-place BitArray size has to fit into one byte");
+            static_assert((SmallSizeMark & SmallSizeMask) && ((64 + SmallSizeMark) & SmallSizeMask)
+                && ((SmallMaxBits + SmallSizeMark) & SmallSizeMask),
+                "in-place sizes must be distinguishable from a large sizeOffset");
+
+            bool isSmall() const { return small.size & SmallSizeMask; }
 };
 
-/**
-@debugoperator{BitArray}
-@m_since_latest
+static_assert(sizeof(BitArray) == 3*sizeof(std::size_t),
+    "Containers::BitArray in-place storage should fit in the same space as a pointer, deleter and size");
 
-Equivalent to @ref BitArrayView::operator<<(Utility::Debug&, BitArrayView) "operator<<(Utility::Debug&, BitArrayView)",
-see its documentation for more information.
-*/
 CORRADE_UTILITY_EXPORT Utility::Debug& operator<<(Utility::Debug& debug, const BitArray& value);
 
-inline BitArray::BitArray(BitArray&& other) noexcept: _data{other._data}, _sizeOffset{other._sizeOffset}, _deleter{other._deleter} {
-    other._data = nullptr;
-    other._sizeOffset = 0;
-    other._deleter = {};
+inline BitArray::BitArray(BitArray&& other) noexcept {
+    if(other.isSmall())
+        small = other.small;
+    else
+        large = other.large;
+    /* Clearing only the size byte would leave the small bytes looking
+       like a heap pointer. */
+    other.large = {};
 }
 
 inline BitArray& BitArray::operator=(BitArray&& other) noexcept {
     using Utility::swap;
-    swap(_data, other._data);
-    swap(_sizeOffset, other._sizeOffset);
-    swap(_deleter, other._deleter);
+    if(isSmall() == other.isSmall()) {
+        if(isSmall())
+            swap(small, other.small);
+        else
+            swap(large, other.large);
+    } else if(isSmall()) {
+        auto tmp = small;
+        large = other.large;
+        other.small = tmp;
+    } else {
+        auto tmp = large;
+        small = other.small;
+        other.large = tmp;
+    }
     return *this;
 }
 
 inline bool BitArray::operator[](std::size_t i) const {
-    CORRADE_DEBUG_ASSERT(i < (_sizeOffset >> 3),
-        "Containers::BitArray::operator[](): index" << i << "out of range for" << (_sizeOffset >> 3) << "bits", {});
-    return _data[((_sizeOffset & 0x07) + i) >> 3] & (1 << ((_sizeOffset + i) & 0x7));
+    CORRADE_DEBUG_ASSERT(i < size(),
+        "Containers::BitArray::operator[](): index" << i << "out of range for" << size() << "bits", {});
+    const char* const d = data();
+    const std::size_t off = offset();
+    return d[(off + i) >> 3] & (1 << ((off + i) & 0x7));
 }
 
 inline void BitArray::set(std::size_t i) {
-    CORRADE_DEBUG_ASSERT(i < (_sizeOffset >> 3),
-        "Containers::BitArray::set(): index" << i << "out of range for" << (_sizeOffset >> 3) << "bits", );
-    _data[((_sizeOffset & 0x07) + i) >> 3] |= (1 << ((_sizeOffset + i) & 0x07));
+    CORRADE_DEBUG_ASSERT(i < size(),
+        "Containers::BitArray::set(): index" << i << "out of range for" << size() << "bits", );
+    char* const d = data();
+    const std::size_t off = offset();
+    d[(off + i) >> 3] |= (1 << ((off + i) & 0x07));
 }
 
 inline void BitArray::reset(std::size_t i) {
-    CORRADE_DEBUG_ASSERT(i < (_sizeOffset >> 3),
-        "Containers::BitArray::reset(): index" << i << "out of range for" << (_sizeOffset >> 3) << "bits", );
-    _data[((_sizeOffset & 0x07) + i) >> 3] &= ~(1 << ((_sizeOffset + i) & 0x07));
+    CORRADE_DEBUG_ASSERT(i < size(),
+        "Containers::BitArray::reset(): index" << i << "out of range for" << size() << "bits", );
+    char* const d = data();
+    const std::size_t off = offset();
+    d[(off + i) >> 3] &= ~(1 << ((off + i) & 0x07));
 }
 
 inline void BitArray::set(std::size_t i, bool value) {
-    CORRADE_DEBUG_ASSERT(i < (_sizeOffset >> 3),
-        "Containers::BitArray::set(): index" << i << "out of range for" << (_sizeOffset >> 3) << "bits", );
-    /* https://graphics.stanford.edu/~seander/bithacks.html#ConditionalSetOrClearBitsWithoutBranching */
-    char& byte = _data[((_sizeOffset & 0x07) + i) >> 3];
-    byte ^= (-char(value) ^ byte) & (1 << ((_sizeOffset + i) & 0x07));
-}
-
-inline char* BitArray::release() {
-    char* const data = _data;
-    _data = nullptr;
-    _sizeOffset = 0;
-    _deleter = {};
-    return data;
+    CORRADE_DEBUG_ASSERT(i < size(),
+        "Containers::BitArray::set(): index" << i << "out of range for" << size() << "bits", );
+    char* const d = data();
+    const std::size_t off = offset();
+    char& byte = d[(off + i) >> 3];
+    byte ^= (-char(value) ^ byte) & (1 << ((off + i) & 0x07));
 }
 
 }}

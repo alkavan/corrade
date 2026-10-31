@@ -244,8 +244,8 @@ void BitArrayTest::constructValueInitSizeTooLarge() {
 
     Containers::String out;
     Error redirectError{&out};
-    BitArray{Corrade::ValueInit, std::size_t{1} << (sizeof(std::size_t)*8 - 3)};
-    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^29 bits, got 536870912\n");
+    BitArray{Corrade::ValueInit, std::size_t{1} << (sizeof(std::size_t)*8 - 5)};
+    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^27 bits, got 134217728\n");
 }
 #endif
 
@@ -279,8 +279,8 @@ void BitArrayTest::constructDirectInitSizeTooLarge() {
 
     Containers::String out;
     Error redirectError{&out};
-    BitArray{Corrade::DirectInit, std::size_t{1} << (sizeof(std::size_t)*8 - 3), true};
-    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^29 bits, got 536870912\n");
+    BitArray{Corrade::DirectInit, std::size_t{1} << (sizeof(std::size_t)*8 - 5), true};
+    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^27 bits, got 134217728\n");
 }
 #endif
 
@@ -307,8 +307,8 @@ void BitArrayTest::constructNoInitSizeTooLarge() {
 
     Containers::String out;
     Error redirectError{&out};
-    BitArray{Corrade::NoInit, std::size_t{1} << (sizeof(std::size_t)*8 - 3)};
-    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^29 bits, got 536870912\n");
+    BitArray{Corrade::NoInit, std::size_t{1} << (sizeof(std::size_t)*8 - 5)};
+    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^27 bits, got 134217728\n");
 }
 #endif
 
@@ -347,8 +347,8 @@ void BitArrayTest::constructTakeOwnershipSizeTooLarge() {
 
     Containers::String out;
     Error redirectError{&out};
-    BitArray{nullptr, 0, std::size_t{1} << (sizeof(std::size_t)*8 - 3), [](char*, std::size_t) {}};
-    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^29 bits, got 536870912\n");
+    BitArray{nullptr, 0, std::size_t{1} << (sizeof(std::size_t)*8 - 5), [](char*, std::size_t) {}};
+    CORRADE_COMPARE(out, "Containers::BitArray: size expected to be smaller than 2^27 bits, got 134217728\n");
 }
 #endif
 
