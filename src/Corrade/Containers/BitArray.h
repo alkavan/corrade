@@ -87,6 +87,11 @@ the @ref Array class:
     Useful when you'll be overwriting the contents anyway. Equivalent to
     @cpp new char[(size + 7)/8] @ce.
 
+Arrays of at most 8 bits are stored in-place inside the instance instead
+of being heap-allocated. @ref data() then points into the instance and is
+invalidated on move. @ref release() copies that byte into a single-byte
+@cpp new[] @ce allocation so the caller can still @cpp delete[] @ce it.
+
 @snippet Containers.cpp BitArray-usage-initialization
 
 <b></b>
@@ -101,11 +106,12 @@ the @ref Array class:
 @subsection Containers-BitArray-usage-wrapping Wrapping externally allocated bit arrays
 
 Similarly to @ref Array, by default the class makes all allocations using
-@cpp operator new[] @ce and deallocates using @cpp operator delete[] @ce. It's
-however also possible to wrap an externally allocated array using
+@cpp operator new[] @ce and deallocates using @cpp operator delete[] @ce,
+with the exception of arrays of at most 8 bits, which are stored in-place.
+It's however also possible to wrap an externally allocated array using
 @ref BitArray(void*, std::size_t, std::size_t, Deleter) together with
 specifying which function to use for deallocation. In addition to a size in
-bits, there's also an offset argument specifying the starting bit in the fist
+bits, there's also an offset argument specifying the starting bit in the first
 byte, consistently with a @ref BasicBitArrayView "BitArrayView". Often it will
 be @cpp 0 @ce however.
 
@@ -254,7 +260,7 @@ class CORRADE_UTILITY_EXPORT BitArray {
          * @cpp operator delete[] @ce.
          * @see @ref BitArray(void*, std::size_t, std::size_t, Deleter)
          */
-        Deleter deleter() const { return _deleter; }
+        Deleter deleter() const { return isInPlace() ? nullptr : _deleter; }
 
         /**
          * @brief Offset in the first byte
@@ -440,14 +446,25 @@ class CORRADE_UTILITY_EXPORT BitArray {
 
     private:
         char* _data;
-        /* The low 3 bits are bit offset in the _data, the rest is size in
-           bits. On 32bit systems this means the view can only address 512M
-           bits (64 MB of memory). While the offset is used only by the
-           wrapping constructor and thus could theoretically be omitted, it
-           makes the restrictions match BitArrayView. If it wouldn't match,
-           slicing would be impossible for large arrays. */
+        /* The low 3 bits are the bit offset in the first byte of _data, the
+           rest is the size in bits. On 32-bit systems this means the array
+           can only address 512M bits (64 MB of memory). The offset is used
+           only by the wrapping constructor and could theoretically be omitted,
+           but keeping it makes the restrictions match BitArrayView. If they
+           didn't match, slicing large arrays would be impossible. */
         std::size_t _sizeOffset;
-        void(*_deleter)(char*, std::size_t);
+        /* Custom deleter, or the in-place data byte. Aliasing the two keeps
+           sizeof(BitArray) unchanged. _data points at _inPlace so bit access stays
+           branch-free; move re-seats that pointer. The self-pointer means the type
+           is not trivially relocatable. */
+        union {
+            void(*_deleter)(char*, std::size_t);
+            char _inPlace;
+        };
+
+        bool isInPlace() const {
+            return _data == &_inPlace;
+        }
 };
 
 /**
@@ -459,17 +476,50 @@ see its documentation for more information.
 */
 CORRADE_UTILITY_EXPORT Utility::Debug& operator<<(Utility::Debug& debug, const BitArray& value);
 
-inline BitArray::BitArray(BitArray&& other) noexcept: _data{other._data}, _sizeOffset{other._sizeOffset}, _deleter{other._deleter} {
+inline BitArray::BitArray(BitArray&& other) noexcept: _data{}, _sizeOffset{other._sizeOffset}, _deleter{} {
+    /* An in-place byte cannot be transferred by pointer; copy it and
+       re-seat _data at this instance. */
+    if(other.isInPlace()) {
+        _inPlace = other._inPlace;
+        _data = &_inPlace;
+    } else {
+        _data = other._data;
+        _deleter = other._deleter;
+    }
     other._data = nullptr;
     other._sizeOffset = 0;
     other._deleter = {};
 }
 
 inline BitArray& BitArray::operator=(BitArray&& other) noexcept {
+    /* Can't swap the payload as a whole. An in-place byte keeps _data
+       pointing at its own _inPlace, and _inPlace aliases _deleter, so each
+       side may only be read through the member that is active. */
+    const bool inPlace = isInPlace();
+    const bool otherInPlace = other.isInPlace();
+
     using Utility::swap;
-    swap(_data, other._data);
     swap(_sizeOffset, other._sizeOffset);
-    swap(_deleter, other._deleter);
+
+    if(inPlace && otherInPlace) {
+        swap(_inPlace, other._inPlace);
+    } else if(inPlace && !otherInPlace) {
+        const char byte = _inPlace;
+        _data = other._data;
+        _deleter = other._deleter;
+        other._inPlace = byte;
+        other._data = &other._inPlace;
+    } else if(!inPlace && otherInPlace) {
+        const char byte = other._inPlace;
+        other._data = _data;
+        other._deleter = _deleter;
+        _inPlace = byte;
+        _data = &_inPlace;
+    } else {
+        swap(_data, other._data);
+        swap(_deleter, other._deleter);
+    }
+
     return *this;
 }
 
@@ -500,7 +550,13 @@ inline void BitArray::set(std::size_t i, bool value) {
 }
 
 inline char* BitArray::release() {
-    char* const data = _data;
+    char* data = _data;
+
+    if(isInPlace()) {
+        /* Caller deletes with delete[], same as a heap-allocated array. */
+        data = new char[1];
+        data[0] = _inPlace;
+    }
     _data = nullptr;
     _sizeOffset = 0;
     _deleter = {};

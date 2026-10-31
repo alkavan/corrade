@@ -47,7 +47,17 @@ BitArray::BitArray(Corrade::ValueInitT, std::size_t size):
     CORRADE_ASSERT(size < std::size_t{1} << (sizeof(std::size_t)*8 - 3),
         "Containers::BitArray: size expected to be smaller than 2^" << Utility::Debug::nospace << (sizeof(std::size_t)*8 - 3) << "bits, got" << size, );
     #endif
-    _data = size ? new char[(size + 7) >> 3]{} : nullptr;
+
+    /* 1-8 bits fit in one byte. Keep it in-place so this doesn't hit the
+       heap. Size 0 stays a nullptr so emptiness is still data() == nullptr. */
+    if(!size)
+        _data = nullptr;
+    else if(size <= 8) {
+        _inPlace = '\0';
+        _data = &_inPlace;
+    } else {
+        _data = new char[(size + 7) >> 3]{};
+    }
 }
 
 BitArray::BitArray(Corrade::NoInitT, std::size_t size):
@@ -63,7 +73,17 @@ BitArray::BitArray(Corrade::NoInitT, std::size_t size):
     CORRADE_ASSERT(size < std::size_t{1} << (sizeof(std::size_t)*8 - 3),
         "Containers::BitArray: size expected to be smaller than 2^" << Utility::Debug::nospace << (sizeof(std::size_t)*8 - 3) << "bits, got" << size, );
     #endif
-    _data = size ? new char[(size + 7) >> 3] : nullptr;
+
+    /* Zero the in-place byte so the union member is active. A one-byte
+       NoInit array is therefore zeroed; larger arrays stay uninitialized. */
+    if(!size)
+        _data = nullptr;
+    else if(size <= 8) {
+        _inPlace = '\0';
+        _data = &_inPlace;
+    } else {
+        _data = new char[(size + 7) >> 3];
+    }
 }
 
 BitArray::BitArray(Corrade::DirectInitT, const std::size_t size, const bool value):
@@ -81,7 +101,10 @@ BitArray::BitArray(Corrade::DirectInitT, const std::size_t size, const bool valu
     #endif
     if(!size)
         _data = nullptr;
-    else if(!value)
+    else if(size <= 8) {
+        _inPlace = value ? '\xff' : '\0';
+        _data = &_inPlace;
+    } else if(!value)
         _data = new char[(size + 7) >> 3]{};
     else {
         _data = new char[(size + 7) >> 3];
@@ -108,6 +131,10 @@ BitArray::BitArray(void* data, const std::size_t offset, const std::size_t size,
 }
 
 BitArray::~BitArray() {
+    /* In-place byte lives in the deleter slot; nothing was allocated. */
+    if(isInPlace())
+        return;
+
     if(_deleter) {
         /* The deleter gets amount of bits spanned by all bits including the
            initial offset -- if offset is 0 and size is 0, it gets 0, but if
